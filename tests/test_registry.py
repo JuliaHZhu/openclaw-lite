@@ -110,6 +110,8 @@ class TestToolRegistry:
 
 
 def test_module_level_registry_has_default_tools():
+    # Tools auto-register on import
+    from openclaw_lite.tools import file, terminal, web  # noqa: F401
     names = registry.list_tools()
     assert "fs_read_file" in names
     assert "fs_write_file" in names
