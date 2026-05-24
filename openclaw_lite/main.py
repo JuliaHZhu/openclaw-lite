@@ -21,7 +21,9 @@ import sys
 from .tools import file, terminal, web  # noqa: F401
 
 from .agent import AIAgent
+from .deck import build_deck
 from .registry import registry
+from .skills import SkillManager
 from .subagent import get_registry
 
 VERSION = "0.1.0"
@@ -38,7 +40,10 @@ def load_config():
         "base_url": os.environ.get("OPENCLAW_BASE_URL"),
         "max_iterations": 30,
         "system_prompt": (
-            "You are a helpful assistant with tool access and subagent orchestration.\n\n"
+            "You are a helpful assistant with tool access, Deck-bound execution, "
+            "and subagent orchestration.\n\n"
+            "DECK: You can only use tools in your Deck (pre-procured per turn). "
+            "If a needed tool is not in the Deck, ask for it or work within limits.\n\n"
             "SUBAGENT TOOLS:\n"
             "- sessions_spawn(task, context_mode='compact'): Delegate a subtask to a\n"
             "  background subagent. Use for parallel independent work.\n"
@@ -74,10 +79,13 @@ def run_session():
 
     agent = AIAgent(config)
     subreg = get_registry()
+    skill_mgr = SkillManager()
+    base_prompt = agent.system_prompt
 
+    loaded = skill_mgr.load_all()
     print(f"🦞 OpenClaw Lite v{VERSION} — {config['model']} ({config['provider']})")
-    print(f"   {len(registry.list_tools())} tools | subagent depth≤3, ≤5 concurrent")
-    print("   /exit  /tools  /subagents  /clear  /help")
+    print(f"   {len(loaded)} skill(s), {len(registry.list_tools())} tools | subagent depth≤3, ≤5 concurrent")
+    print("   /exit  /tools  /skills  /subagents  /clear  /help")
     print("-" * 50)
 
     messages = []
@@ -94,13 +102,23 @@ def run_session():
             break
         if ui.lower() == "/help":
             print(
-                "Commands: /exit, /tools, /subagents, /clear, /help\n"
+                "Commands: /exit, /tools, /skills, /subagents, /clear, /help\n"
                 "Subagent tools: sessions_spawn, subagents_list, subagents_status"
             )
             continue
         if ui.lower() == "/tools":
             for cat, names in sorted(registry.list_by_category().items()):
                 print(f"  [{cat}] {', '.join(names)}")
+            continue
+        if ui.lower() == "/skills":
+            skills = skill_mgr.list_skills()
+            if skills:
+                for name, meta in skills.items():
+                    t = f"  triggers: {', '.join(meta.get('triggers',[]))}" if meta.get("triggers") else ""
+                    tl = f"  tools: {', '.join(meta.get('tools',[]))}" if meta.get("tools") else ""
+                    print(f"  • {name}: {meta.get('description','')}{t}{tl}")
+            else:
+                print("No skills. Add .md files to skills/")
             continue
         if ui.lower() == "/subagents":
             print(subreg.summary())

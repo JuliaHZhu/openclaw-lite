@@ -4,3 +4,4 @@ __pycache__/
 dist/
 *.pyc
 .DS_Store
+.skills_cache.json
