@@ -1,4 +1,4 @@
-"""Tests for tools/*.py — bare tools with no security guards."""
+"""Tests for tools/*.py — bare tools without security guards."""
 from pathlib import Path
 
 import pytest
@@ -12,24 +12,19 @@ class TestFileTools:
     def test_read_file(self, tmp_path):
         f = tmp_path / "test.txt"
         f.write_text("line1\nline2\nline3")
-        result = fs_read_file(str(f), offset=2, limit=1)
-        assert result == "line2"
+        result = fs_read_file(str(f), offset=1, limit=2)
+        assert result == "line1\nline2"
 
-    def test_read_file_not_found(self):
-        result = fs_read_file("/nonexistent/path.txt")
-        assert "Error" in result
-
-    def test_write_and_read_roundtrip(self, tmp_path):
-        target = str(tmp_path / "round.txt")
-        fs_write_file(target, "hello world")
-        result = fs_read_file(target)
-        assert "hello world" in result
-
-    def test_write_creates_parent_dirs(self, tmp_path):
-        target = str(tmp_path / "deep" / "nested" / "file.txt")
-        result = fs_write_file(target, "ok")
+    def test_write_file(self, tmp_path):
+        f = tmp_path / "out.txt"
+        result = fs_write_file(str(f), "hello world")
         assert "Written" in result
-        assert Path(target).read_text() == "ok"
+        assert f.read_text() == "hello world"
+
+    def test_write_creates_parents(self, tmp_path):
+        f = tmp_path / "sub" / "dir" / "file.txt"
+        fs_write_file(str(f), "nested")
+        assert f.read_text() == "nested"
 
     def test_search_files(self, tmp_path):
         (tmp_path / "a.py").write_text("hello world\nfoo bar")
@@ -38,36 +33,43 @@ class TestFileTools:
         assert "a.py" in result
         assert "b.py" in result
 
-    def test_search_files_no_match(self, tmp_path):
-        (tmp_path / "x.py").write_text("nothing here")
-        result = fs_search_files("zzzTOP", str(tmp_path))
+    def test_search_no_matches(self, tmp_path):
+        (tmp_path / "x.txt").write_text("nothing here")
+        result = fs_search_files("xyz", str(tmp_path))
         assert result == "No matches"
+
+    def test_read_file_error(self):
+        result = fs_read_file("/nonexistent/path/file.txt")
+        assert "Error:" in result
 
 
 class TestTerminalTools:
-    def test_echo(self):
+    def test_sys_terminal_runs_command(self):
         result = sys_terminal("echo hello")
         assert "hello" in result
 
-    def test_ls(self):
-        result = sys_terminal("ls /tmp")
-        assert result.strip() != ""
+    def test_sys_terminal_with_timeout(self):
+        result = sys_terminal("echo ok", timeout=5)
+        assert "ok" in result
 
-    def test_command_not_found(self):
-        result = sys_terminal("nonexistent_cmd_xyz_12345")
-        assert result != ""
+    def test_sys_terminal_error(self):
+        result = sys_terminal("nonexistent_command_xyz_123")
+        assert "Error:" in result or "not found" in result.lower() or "(no output)" in result
 
 
 class TestWebTools:
-    def test_search_returns_results(self):
-        result = net_web_search("python")
-        assert result  # should return something or "No results"
-        # Don't assert on external service content, just that it doesn't crash
+    def test_web_search_returns_results(self):
+        result = net_web_search("python programming language", num_results=3)
+        assert isinstance(result, str)
+        # DuckDuckGo may return results or "No results"
+        assert len(result) > 0
 
-    def test_search_empty_query(self):
-        result = net_web_search("")
-        assert result  # should not crash
+    def test_web_extract_returns_text(self):
+        result = net_web_extract("https://example.com")
+        assert isinstance(result, str)
+        # example.com should return some text
+        assert len(result) > 0
 
-    def test_extract_invalid_url(self):
-        result = net_web_extract("not-a-valid-url")
-        assert "Error" in result.lower() or "Fetch error" in result or result
+    def test_web_extract_error(self):
+        result = net_web_extract("https://invalid-domain-12345.example")
+        assert "Fetch error:" in result or "error" in result.lower()
