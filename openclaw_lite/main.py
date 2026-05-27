@@ -6,11 +6,16 @@ Usage:
     openclaw-lite -m "hello"   Quick model ping test
     openclaw-lite -v           Show version
 
-Config via env vars:
-    OPENCLAW_API_KEY           API key (required)
-    OPENCLAW_PROVIDER          openai (default) or anthropic
-    OPENCLAW_MODEL             model name (default: kimi-k2.6)
-    OPENCLAW_BASE_URL          optional base URL override (default: https://api.moonshot.cn/v1)
+Options:
+    -m, --ping MSG             Quick model ping test
+    -v, --version              Show version
+    -h, --help                 Show this help
+
+Config:
+    export OPENCLAW_API_KEY=sk-...
+    export OPENCLAW_PROVIDER=openai       # or anthropic
+    export OPENCLAW_MODEL=kimi-k2.6
+    export OPENCLAW_BASE_URL=https://api.moonshot.cn/v1
 """
 
 import argparse
