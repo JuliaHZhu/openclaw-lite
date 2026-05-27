@@ -8,9 +8,9 @@ Usage:
 
 Config via env vars:
     OPENCLAW_API_KEY           API key (required)
-    OPENCLAW_PROVIDER          anthropic (default) or openai
-    OPENCLAW_MODEL             model name
-    OPENCLAW_BASE_URL          optional base URL override
+    OPENCLAW_PROVIDER          openai (default) or anthropic
+    OPENCLAW_MODEL             model name (default: kimi-k2.6)
+    OPENCLAW_BASE_URL          optional base URL override (default: https://api.moonshot.cn/v1)
 """
 
 import argparse
@@ -34,10 +34,10 @@ def load_config():
     if not key:
         return None
     return {
-        "provider": os.environ.get("OPENCLAW_PROVIDER", "anthropic"),
-        "model": os.environ.get("OPENCLAW_MODEL", "claude-sonnet-4-20250514"),
+        "provider": os.environ.get("OPENCLAW_PROVIDER", "openai"),
+        "model": os.environ.get("OPENCLAW_MODEL", "kimi-k2.6"),
         "api_key": key,
-        "base_url": os.environ.get("OPENCLAW_BASE_URL"),
+        "base_url": os.environ.get("OPENCLAW_BASE_URL", "https://api.moonshot.cn/v1"),
         "max_iterations": 30,
         "system_prompt": (
             "You are a helpful assistant with tool access, Deck-bound execution, "
@@ -74,13 +74,18 @@ def run_session():
         sys.exit(
             "❌ Set OPENCLAW_API_KEY env var.\n"
             "  export OPENCLAW_API_KEY=sk-...\n"
-            "  export OPENCLAW_MODEL=claude-sonnet-4-20250514  # optional"
+            "  export OPENCLAW_MODEL=kimi-k2.6  # optional\n"
+            "  export OPENCLAW_PROVIDER=openai  # optional"
         )
 
     agent = AIAgent(config)
     subreg = get_registry()
     skill_mgr = SkillManager()
     base_prompt = agent.system_prompt
+
+    # 默认启用所有已注册工具
+    all_tools = registry.list_tools()
+    agent.enabled_tools = all_tools
 
     loaded = skill_mgr.load_all()
     print(f"🦞 OpenClaw Lite v{VERSION} — {config['model']} ({config['provider']})")

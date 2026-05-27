@@ -1,9 +1,11 @@
-"""AI Agent — dual-protocol (Anthropic/OpenAI) with subagent orchestration.
+"""AI Agent — dual-protocol (OpenAI/Anthropic) with subagent orchestration.
 
 Extends the hermes-lite agent loop with three subagent tools:
   sessions_spawn   — delegate a task to a background subagent
   subagents_list   — list all subagent runs
   subagents_status — get detailed status of a subagent run
+
+Subagent context tracking uses contextvars so each thread sees its own agent.
 """
 
 import json
@@ -11,13 +13,19 @@ import uuid
 from typing import List, Dict, Optional
 
 from .registry import registry
-from .subagent import spawn_subagent, get_registry
+from .subagent import (
+    spawn_subagent,
+    get_registry,
+    get_current_agent,
+    set_current_agent,
+    reset_current_agent,
+)
 
 
 class AIAgent:
     def __init__(self, config: dict):
         self.config = config
-        self.model = config.get("model", "claude-sonnet-4-20250514")
+        self.model = config.get("model", "kimi-k2.6")
         self.max_iterations = config.get("max_iterations", 30)
         self.system_prompt = config.get(
             "system_prompt", "You are a helpful assistant with tool access."
@@ -28,18 +36,15 @@ class AIAgent:
         self.session_id = config.get("session_id", str(uuid.uuid4())[:8])
         self.depth = config.get("depth", 0)  # 0 = root agent
         self._messages: List[dict] = []  # track conversation for spawn context
-        self._auto_register_subagent_tools()
+        self._register_subagent_tools()
         self._init_client()
 
-    def _auto_register_subagent_tools(self):
-        """Register subagent orchestration tools if not already registered."""
-        # Only register once (check by name)
-        if not registry.has_tool("sessions_spawn"):
-            self._register_subagent_tools()
-
     def _register_subagent_tools(self):
-        """Register the three subagent tools into the global registry."""
-        agent_ref = self  # capture for closure
+        """Register subagent orchestration tools into the global registry.
+
+        Handlers fetch the *current* agent via contextvars so nested spawns
+        use the correct parent identity and depth.
+        """
 
         def _sessions_spawn(
             task: str,
@@ -59,13 +64,22 @@ class AIAgent:
                     "full" — complete parent conversation history
                     "none" — only the task itself
             """
+            agent = get_current_agent()
+            if agent is None:
+                return "Error: no active agent context for spawn"
+
             reg = get_registry()
+            # Pass depth so child knows its own level
+            child_config = dict(agent.config)
+            child_config["depth"] = agent.depth + 1
+            child_config["tools"] = agent.enabled_tools  # inherit parent's tool set
+
             result = spawn_subagent(
                 task=task,
-                agent_factory=lambda: AIAgent(agent_ref.config),
-                parent_id=agent_ref.session_id,
-                parent_messages=agent_ref._messages,
-                depth=agent_ref.depth + 1,
+                agent_factory=lambda: AIAgent(child_config),
+                parent_id=agent.session_id,
+                parent_messages=agent._messages,
+                depth=agent.depth + 1,
                 model=model or "",
                 context_mode=context_mode,
             )
@@ -81,8 +95,12 @@ class AIAgent:
 
             Returns a table of subagents with id, status, task, and timing.
             """
+            agent = get_current_agent()
+            if agent is None:
+                return "Error: no active agent context"
+
             reg = get_registry()
-            runs = reg.list_runs(parent_id=agent_ref.session_id)
+            runs = reg.list_runs(parent_id=agent.session_id)
             if not runs:
                 return "No subagents spawned yet."
             lines = ["Subagents:"]
@@ -190,7 +208,7 @@ class AIAgent:
         )
 
     def _init_client(self):
-        provider = self.config.get("provider", "anthropic")
+        provider = self.config.get("provider", "openai")
         if provider == "openai":
             from openai import OpenAI
             self.client = OpenAI(
@@ -230,6 +248,20 @@ class AIAgent:
 
         self._tool_schema_cache[cache_key] = result
         return result
+
+    def _extract_reasoning(self, msg) -> Optional[str]:
+        """Extract reasoning_content from thinking models (e.g. Moonshot kimi-k2.6)."""
+        if self._protocol == "openai":
+            # OpenAI-style response may carry reasoning_content on the message object
+            raw = getattr(msg, "reasoning_content", None)
+            if raw:
+                return str(raw)
+            # Some providers nest it inside choices[0].message
+            if hasattr(msg, "model_extra") and msg.model_extra:
+                raw = msg.model_extra.get("reasoning_content")
+                if raw:
+                    return str(raw)
+        return None
 
     def _to_api_messages(self, messages: List[Dict]) -> List[Dict]:
         api_msgs = []
@@ -295,11 +327,20 @@ class AIAgent:
                         "arguments": args
                     })
         else:
+            # Handle Moonshot kimi-k2.6 tool_calls with string arguments
             for tc in (msg.tool_calls or []):
+                raw_args = tc.function.arguments
+                if isinstance(raw_args, str):
+                    try:
+                        parsed = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        parsed = {"raw": raw_args}
+                else:
+                    parsed = raw_args
                 calls.append({
                     "id": tc.id,
                     "name": tc.function.name,
-                    "arguments": json.loads(tc.function.arguments)
+                    "arguments": parsed
                 })
         return calls
 
@@ -313,91 +354,105 @@ class AIAgent:
         # Track messages for subagent spawn context
         self._messages = messages
 
-        active_tools = self._build_tools(tools)
-        api_messages = self._to_api_messages(messages)
+        # Bind this agent as the current context for subagent tool handlers
+        token = set_current_agent(self)
+        try:
+            active_tools = self._build_tools(tools)
+            api_messages = self._to_api_messages(messages)
 
-        for i in range(self.max_iterations):
-            if self._protocol == "anthropic":
-                kwargs = {
-                    "model": self.model,
-                    "max_tokens": 4096,
-                    "messages": api_messages,
-                    "system": self.system_prompt,
+            for i in range(self.max_iterations):
+                if self._protocol == "anthropic":
+                    kwargs = {
+                        "model": self.model,
+                        "max_tokens": 4096,
+                        "messages": api_messages,
+                        "system": self.system_prompt,
+                    }
+                    if active_tools:
+                        kwargs["tools"] = active_tools
+                    response = self.client.messages.create(**kwargs)
+                    msg = response
+                else:
+                    kwargs = {
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": self.system_prompt}
+                        ] + api_messages,
+                    }
+                    if active_tools:
+                        kwargs["tools"] = active_tools
+                        kwargs["tool_choice"] = "auto"
+                    response = self.client.chat.completions.create(**kwargs)
+                    msg = response.choices[0].message
+
+                text = self._extract_text(msg)
+                reasoning = self._extract_reasoning(msg)
+                tool_calls = self._extract_tool_calls(msg)
+
+                # Prepend reasoning to text so the model "remembers" its thinking
+                if reasoning:
+                    text = f"[Thinking]\n{reasoning}\n\n{text}".strip()
+
+                if not tool_calls:
+                    return text
+
+                assistant_msg = {
+                    "role": "assistant", "content": text, "tool_calls": tool_calls
                 }
-                if active_tools:
-                    kwargs["tools"] = active_tools
-                response = self.client.messages.create(**kwargs)
-                msg = response
-            else:
-                kwargs = {
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": self.system_prompt}
-                    ] + api_messages,
-                }
-                if active_tools:
-                    kwargs["tools"] = active_tools
-                    kwargs["tool_choice"] = "auto"
-                response = self.client.chat.completions.create(**kwargs)
-                msg = response.choices[0].message
-
-            text = self._extract_text(msg)
-            tool_calls = self._extract_tool_calls(msg)
-
-            if not tool_calls:
-                return text
-
-            assistant_msg = {
-                "role": "assistant", "content": text, "tool_calls": tool_calls
-            }
-            messages.append(assistant_msg)
-
-            if self._protocol == "anthropic":
-                api_msgs = []
-                if text:
-                    api_msgs.append({"type": "text", "text": text})
-                for tc in tool_calls:
-                    api_msgs.append({
-                        "type": "tool_use",
-                        "id": tc["id"],
-                        "name": tc["name"],
-                        "input": tc["arguments"]
-                    })
-                api_messages.append({"role": "assistant", "content": api_msgs})
-            else:
-                api_messages.append({
-                    "role": "assistant",
-                    "content": text,
-                    "tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": json.dumps(tc["arguments"])
-                            }
-                        }
-                        for tc in tool_calls
-                    ]
-                })
-
-            for tc in tool_calls:
-                result = registry.call(tc["name"], tc["arguments"])
-                tool_msg = {
-                    "role": "tool", "tool_call_id": tc["id"], "content": result
-                }
-                messages.append(tool_msg)
+                messages.append(assistant_msg)
 
                 if self._protocol == "anthropic":
-                    api_messages.append({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tc["id"],
-                            "content": result
-                        }]
-                    })
+                    api_msgs = []
+                    if text:
+                        api_msgs.append({"type": "text", "text": text})
+                    for tc in tool_calls:
+                        api_msgs.append({
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["name"],
+                            "input": tc["arguments"]
+                        })
+                    api_messages.append({"role": "assistant", "content": api_msgs})
                 else:
-                    api_messages.append(tool_msg)
+                    assistant_api_msg = {
+                        "role": "assistant",
+                        "content": text,
+                        "tool_calls": [
+                            {
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["name"],
+                                    "arguments": json.dumps(tc["arguments"])
+                                }
+                            }
+                            for tc in tool_calls
+                        ]
+                    }
+                    # Moonshot kimi-k2.6: preserve reasoning_content in tool call messages
+                    if reasoning:
+                        assistant_api_msg["reasoning_content"] = reasoning
+                    api_messages.append(assistant_api_msg)
 
-        return "(reached max iterations)"
+                for tc in tool_calls:
+                    result = registry.call(tc["name"], tc["arguments"])
+                    tool_msg = {
+                        "role": "tool", "tool_call_id": tc["id"], "content": result
+                    }
+                    messages.append(tool_msg)
+
+                    if self._protocol == "anthropic":
+                        api_messages.append({
+                            "role": "user",
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": tc["id"],
+                                "content": result
+                            }]
+                        })
+                    else:
+                        api_messages.append(tool_msg)
+
+            return "(reached max iterations)"
+        finally:
+            reset_current_agent(token)

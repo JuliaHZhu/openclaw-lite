@@ -6,13 +6,35 @@ Core patterns preserved from OpenClaw:
   3. DEPTH      — reject recursive spawn beyond max depth (default 3)
   4. CONCURRENCY — max N children per parent (default 5)
   5. ANNOUNCE   — subagent completion stored in registry; parent polls
+
+Agent context tracking uses contextvars so subagent tool handlers always see
+the correct parent agent, even in nested spawn chains.
 """
 
+import contextvars
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Callable, Any
+
+# Thread-local agent reference for subagent tool handlers
+_agent_ctx: contextvars.ContextVar = contextvars.ContextVar("agent", default=None)
+
+
+def get_current_agent():
+    """Get the agent bound to the current thread/context."""
+    return _agent_ctx.get()
+
+
+def set_current_agent(agent):
+    """Bind an agent to the current context. Returns a token for reset."""
+    return _agent_ctx.set(agent)
+
+
+def reset_current_agent(token):
+    """Reset the agent context using a token from set_current_agent."""
+    _agent_ctx.reset(token)
 
 
 @dataclass
@@ -46,7 +68,7 @@ class SubagentRegistry:
         self.max_depth = max_depth
         self.max_children = max_children
 
-    # ── spawn gate ───────────────────────────────────────────────
+    # ── spawn gate ──────────────────────────────────────────────
 
     def can_spawn(self, parent_id: str, requested_depth: int) -> tuple:
         """Check spawn policies. Returns (allowed: bool, reason: str)."""
@@ -68,7 +90,7 @@ class SubagentRegistry:
                 )
             return True, ""
 
-    # ── lifecycle ────────────────────────────────────────────────
+    # ── lifecycle ──────────────────────────────────────────────
 
     def register(self, run: SubagentRun):
         with self._lock:
@@ -91,7 +113,7 @@ class SubagentRegistry:
             if status in ("completed", "failed"):
                 r.finished_at = time.time()
 
-    # ── queries ──────────────────────────────────────────────────
+    # ── queries ───────────────────────────────────────────────
 
     def get(self, run_id: str) -> Optional[SubagentRun]:
         with self._lock:
@@ -123,7 +145,7 @@ class SubagentRegistry:
             return f"{total} total, {active} active, {done} completed, {failed} failed"
 
 
-# ── module-level singleton ────────────────────────────────────────
+# ── module-level singleton ───────────────────────────────────────────
 
 _registry = SubagentRegistry()
 
@@ -153,7 +175,7 @@ def _run_to_dict(r: SubagentRun) -> dict:
     return d
 
 
-# ── spawn runner (called in a thread) ────────────────────────────
+# ── spawn runner (called in a thread) ─────────────────────────────
 
 def _run_subagent(
     run_id: str,
@@ -170,27 +192,32 @@ def _run_subagent(
     try:
         agent = agent_factory()
 
-        # Build subagent messages
-        if context_mode == "full":
-            messages = list(parent_messages)
-        elif context_mode == "compact":
-            # Compact: summarize parent context briefly
-            summary = _compact_context(parent_messages, max_chars=1500)
-            messages = [{"role": "user", "content": summary}]
-        else:  # "none"
-            messages = []
+        # Bind this agent as the current context for any nested spawns
+        token = set_current_agent(agent)
+        try:
+            # Build subagent messages
+            if context_mode == "full":
+                messages = list(parent_messages)
+            elif context_mode == "compact":
+                # Compact: summarize parent context briefly
+                summary = _compact_context(parent_messages, max_chars=1500)
+                messages = [{"role": "user", "content": summary}]
+            else:  # "none"
+                messages = []
 
-        messages.append({"role": "user", "content": task})
+            messages.append({"role": "user", "content": task})
 
-        # Override system prompt for subagent role
-        original_prompt = agent.system_prompt
-        agent.system_prompt = (
-            f"You are a subagent. Your task: {task}\n\n"
-            f"{original_prompt}"
-        )
+            # Override system prompt for subagent role
+            original_prompt = agent.system_prompt
+            agent.system_prompt = (
+                f"You are a subagent. Your task: {task}\n\n"
+                f"{original_prompt}"
+            )
 
-        result = agent.run(messages)
-        reg.update(run_id, status="completed", result=result)
+            result = agent.run(messages)
+            reg.update(run_id, status="completed", result=result)
+        finally:
+            reset_current_agent(token)
 
     except Exception as e:
         reg.update(run_id, status="failed", error=str(e))
@@ -215,7 +242,7 @@ def _compact_context(messages: List[dict], max_chars: int = 1500) -> str:
     return "\n".join(reversed(parts))
 
 
-# ── spawn entry point (called by sessions_spawn tool) ────────────
+# ── spawn entry point (called by sessions_spawn tool) ──────────────────
 
 def spawn_subagent(
     *,
